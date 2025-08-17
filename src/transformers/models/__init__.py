@@ -45,6 +45,9 @@ if TYPE_CHECKING:
     from .bitnet import *
     from .blenderbot import *
     from .blenderbot_small import *
+    from .blockllama import *
+    from .blockmistral import *
+    from .blockqwen3 import *
     from .blip import *
     from .blip_2 import *
     from .bloom import *
