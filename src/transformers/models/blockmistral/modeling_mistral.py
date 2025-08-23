@@ -164,6 +164,8 @@ class MistralAttention(nn.Module):
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
+        print(block_start_idxs)
+        exit()
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -175,6 +177,8 @@ class MistralAttention(nn.Module):
             sliding_window=getattr(self.config, "sliding_window", None),  # main diff with Llama
             **kwargs,
         )
+        print(attn_output.shape)
+        exit()
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)

@@ -184,8 +184,41 @@ class BlockQwen3Attention(nn.Module):
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
 
     # TOOD Zeyu
-    def flash_attn(self, query_states, key_states, value_states, scaling, block_start_idxs):
-        pass
+    def flash_attn(self, query_states, key_states, value_states, scaling, block_start_idxs, attention_interface, **kwargs):
+        # only single prompt
+        # qkv: [batch, num_heads, seq_len, head_dim]
+        attn_outputs = []
+        for block_idx in range(len(block_start_idxs[0])-1):
+            query_states_block = query_states[:, :, block_start_idxs[0][block_idx]:block_start_idxs[0][block_idx+1], :]
+            key_states_block = key_states[:, :, block_start_idxs[0][block_idx]:block_start_idxs[0][block_idx+1], :]
+            value_states_block = value_states[:, :, block_start_idxs[0][block_idx]:block_start_idxs[0][block_idx+1], :]
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states_block,
+                key_states_block,
+                value_states_block,
+                attention_mask=None,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,  # diff with Llama
+                **kwargs,
+            )
+            attn_outputs.append(attn_output)
+        query_states_block = query_states[:, :, block_start_idxs[0][-1]:, :]
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states_block,
+            key_states,
+            value_states,
+            attention_mask=None,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,  # diff with Llama
+            **kwargs,
+        )
+        attn_outputs.append(attn_output)
+
+        return torch.cat(attn_outputs, dim=1).contiguous()
 
     def forward(
         self,
@@ -212,9 +245,9 @@ class BlockQwen3Attention(nn.Module):
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
 
-        # attention_interface: Callable = eager_attention_forward
-        # if self.config._attn_implementation != "eager":
-        #     attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         # attn_output, attn_weights = attention_interface(
         #     self,
@@ -229,15 +262,33 @@ class BlockQwen3Attention(nn.Module):
         # )
 
         # TOOD Zeyu
-        attn_output = self.flash_attn(
-            query_states,
-            key_states,
-            value_states,
-            scaling=self.scaling,
-            block_start_idxs=block_start_idxs,
-        )
+        # delete block_start_idxs from kwargs
+        block_start_idxs = kwargs.pop('block_start_idxs')
 
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        if query_states.shape[2] == 1:
+            attn_output, _ = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask=None,
+                scaling=self.scaling,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                sliding_window=self.sliding_window,  # diff with Llama
+                **kwargs,
+            )
+        else:
+            attn_output = self.flash_attn(
+                query_states,
+                key_states,
+                value_states,
+                scaling=self.scaling,
+                block_start_idxs=block_start_idxs,
+                attention_interface=attention_interface,
+                **kwargs,
+            )
+
+        attn_output = attn_output.reshape(*input_shape, -1)
         attn_output = self.o_proj(attn_output)
         return attn_output, None
 
