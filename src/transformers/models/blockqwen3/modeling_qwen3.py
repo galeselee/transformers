@@ -201,7 +201,7 @@ class BlockQwen3Attention(nn.Module):
                 dropout=0.0 if not self.training else self.attention_dropout,
                 scaling=self.scaling,
                 sliding_window=self.sliding_window,  # diff with Llama
-                **kwargs,
+                # **kwargs,
             )
             attn_outputs.append(attn_output)
         query_states_block = query_states[:, :, block_start_idxs[0][-1]:, :]
@@ -214,7 +214,7 @@ class BlockQwen3Attention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=self.sliding_window,  # diff with Llama
-            **kwargs,
+            # **kwargs,
         )
         attn_outputs.append(attn_output)
 
@@ -275,7 +275,7 @@ class BlockQwen3Attention(nn.Module):
                 scaling=self.scaling,
                 dropout=0.0 if not self.training else self.attention_dropout,
                 sliding_window=self.sliding_window,  # diff with Llama
-                **kwargs,
+                use_cache=True,
             )
         else:
             attn_output = self.flash_attn(
@@ -287,6 +287,7 @@ class BlockQwen3Attention(nn.Module):
                 attention_interface=attention_interface,
                 **kwargs,
             )
+
 
         attn_output = attn_output.reshape(*input_shape, -1)
         attn_output = self.o_proj(attn_output)

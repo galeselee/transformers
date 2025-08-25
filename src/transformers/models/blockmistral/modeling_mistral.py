@@ -31,7 +31,7 @@ from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from .configuration_mistral import MistralConfig
 
 
-class MistralMLP(nn.Module):
+class BlockMistralMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -119,7 +119,7 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-class MistralAttention(nn.Module):
+class BlockMistralAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, config: MistralConfig, layer_idx: int):
@@ -135,6 +135,37 @@ class MistralAttention(nn.Module):
         self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
+
+    def flash_attn(self, query_states, key_states, value_states, scaling, block_start_idxs, attention_interface, **kwargs):
+        attn_outputs = []
+        for block_idx in range(len(block_start_idxs[0])-1):
+            query_states_block = query_states[:, :, block_start_idxs[0][block_idx]:block_start_idxs[0][block_idx+1], :]
+            key_states_block = key_states[:, :, block_start_idxs[0][block_idx]:block_start_idxs[0][block_idx+1], :]
+            value_states_block = value_states[:, :, block_start_idxs[0][block_idx]:block_start_idxs[0][block_idx+1], :]
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states_block,
+                key_states_block,
+                value_states_block,
+                attention_mask=None,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=getattr(self.config, "sliding_window", None),  # main diff with Llama
+            )
+            attn_outputs.append(attn_output)
+        query_states_block = query_states[:, :, block_start_idxs[0][-1]:, :]
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states_block,
+            key_states,
+            value_states,
+            attention_mask=None,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=getattr(self.config, "sliding_window", None),
+        )
+        attn_outputs.append(attn_output)
+        return torch.cat(attn_outputs, dim=1).contiguous()
 
     def forward(
         self,
@@ -164,29 +195,29 @@ class MistralAttention(nn.Module):
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        print(block_start_idxs)
-        exit()
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=getattr(self.config, "sliding_window", None),  # main diff with Llama
-            **kwargs,
-        )
-        print(attn_output.shape)
-        exit()
+        block_start_idxs = kwargs.pop('block_start_idxs')
+        if query_states.shape[2] == 1:
+            attn_output, _ = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=getattr(self.config, "sliding_window", None),
+                use_cache=True,
+            )
+        else:
+            attn_output = self.flash_attn(query_states, key_states, value_states, self.scaling, block_start_idxs, attention_interface, **kwargs)
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+        return attn_output, None
 
 
 @use_kernel_forward_from_hub("RMSNorm")
-class MistralRMSNorm(nn.Module):
+class BlockMistralRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
         MistralRMSNorm is equivalent to T5LayerNorm
@@ -206,14 +237,14 @@ class MistralRMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
-class MistralDecoderLayer(GradientCheckpointingLayer):
+class BlockMistralDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: MistralConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = MistralAttention(config=config, layer_idx=layer_idx)
-        self.mlp = MistralMLP(config)
-        self.input_layernorm = MistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = MistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = BlockMistralAttention(config=config, layer_idx=layer_idx)
+        self.mlp = BlockMistralMLP(config)
+        self.input_layernorm = BlockMistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = BlockMistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -250,11 +281,11 @@ class MistralDecoderLayer(GradientCheckpointingLayer):
 
 
 @auto_docstring
-class MistralPreTrainedModel(PreTrainedModel):
+class BlockMistralPreTrainedModel(PreTrainedModel):
     config: MistralConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["MistralDecoderLayer"]
+    _no_split_modules = ["BlockMistralDecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn = True
     _supports_sdpa = True
@@ -263,12 +294,12 @@ class MistralPreTrainedModel(PreTrainedModel):
     _can_compile_fullgraph = True
     _supports_attention_backend = True
     _can_record_outputs = {
-        "hidden_states": MistralDecoderLayer,
-        "attentions": MistralAttention,
+        "hidden_states": BlockMistralDecoderLayer,
+        "attentions": BlockMistralAttention,
     }
 
 
-class MistralRotaryEmbedding(nn.Module):
+class BlockMistralRotaryEmbedding(nn.Module):
     def __init__(self, config: MistralConfig, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
@@ -303,7 +334,7 @@ class MistralRotaryEmbedding(nn.Module):
 
 
 @auto_docstring
-class MistralModel(MistralPreTrainedModel):
+class BlockMistralModel(BlockMistralPreTrainedModel):
     def __init__(self, config: MistralConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -311,10 +342,10 @@ class MistralModel(MistralPreTrainedModel):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [MistralDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [BlockMistralDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = MistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = MistralRotaryEmbedding(config=config)
+        self.norm = BlockMistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = BlockMistralRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
@@ -383,14 +414,14 @@ class MistralModel(MistralPreTrainedModel):
 
 
 @auto_docstring
-class MistralForCausalLM(MistralPreTrainedModel, GenerationMixin):
+class BlockMistralForCausalLM(BlockMistralPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = MistralModel(config)
+        self.model = BlockMistralModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -435,6 +466,9 @@ class MistralForCausalLM(MistralPreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
+        if 'block_start_idxs' not in kwargs:
+            raise ValueError("block_start_idxs must be provided in kwargs")
+
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -464,22 +498,22 @@ class MistralForCausalLM(MistralPreTrainedModel, GenerationMixin):
         )
 
 
-class MistralForTokenClassification(GenericForTokenClassification, MistralPreTrainedModel):
+class BlockMistralForTokenClassification(GenericForTokenClassification, BlockMistralPreTrainedModel):
     pass
 
 
-class MistralForSequenceClassification(GenericForSequenceClassification, MistralPreTrainedModel):
+class BlockMistralForSequenceClassification(GenericForSequenceClassification, BlockMistralPreTrainedModel):
     pass
 
 
-class MistralForQuestionAnswering(GenericForQuestionAnswering, MistralPreTrainedModel): ...
+class BlockMistralForQuestionAnswering(GenericForQuestionAnswering, BlockMistralPreTrainedModel): ...
 
 
 __all__ = [
-    "MistralForCausalLM",
-    "MistralForQuestionAnswering",
-    "MistralModel",
-    "MistralPreTrainedModel",
-    "MistralForSequenceClassification",
-    "MistralForTokenClassification",
+    "BlockMistralForCausalLM",
+    "BlockMistralForQuestionAnswering",
+    "BlockMistralModel",
+    "BlockMistralPreTrainedModel",
+    "BlockMistralForSequenceClassification",
+    "BlockMistralForTokenClassification",
 ]
